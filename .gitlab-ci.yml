@@ -1,7 +1,202 @@
-include:
-  - template: Auto-DevOps.gitlab-ci.yml
+# Все job запускаются либо через UI, либо при оформлении MR.
+# Артифакты сохраняются, даже если сканеры нашли уязвимость или утечку.
 
-variables:
-  SAST_EXCLUDED_PATHS: "frontend/src/assets/private/**"
-  TEST_DISABLED: "true"
-  DAST_DISABLED: "true"
+stages:
+        - pre-build
+        - post-build
+        - test-time
+
+############################################################
+# Secrets Scan
+trufflehog-scan:
+    stage: pre-build
+    image: 
+        name: ghcr.io/trufflesecurity/trufflehog:3.91.2
+        entrypoint: [""] 
+    variables:
+        TRUFFLEHOG_CONFIG: "https://raw.githubusercontent.com/trufflesecurity/trufflehog/main/examples/generic.yml"  # Используем конфигурацию
+        TRUFFLEHOG_OUTPUT: "gitleaks-report.json"
+    before_script:
+    # Скачиваем последнюю версию конфигурации
+        - wget $TRUFFLEHOG_CONFIG
+    script:
+    # Запускаем сканирование без --results=verified,unknown, так как не видно сработок сканера
+        - trufflehog filesystem --config=$CI_PROJECT_DIR/generic.yml --json  $CI_PROJECT_DIR > $CI_PROJECT_DIR/$TRUFFLEHOG_OUTPUT
+    after_script:
+    # Проверяем наличие отчета (создаем пустой если не найден)
+        - if [ ! -f $CI_PROJECT_DIR/$TRUFFLEHOG_OUTPUT ]; then echo '{"runs":[]}' > $CI_PROJECT_DIR/$TRUFFLEHOG_OUTPUT; fi
+    artifacts:
+        reports:
+            secret_detection: $CI_PROJECT_DIR/$TRUFFLEHOG_OUTPUT  # Специальная интеграция для GitLab
+        paths:
+            - $CI_PROJECT_DIR/$TRUFFLEHOG_OUTPUT
+        expire_in: 1 week
+        when: always
+    allow_failure: true  # Не прерывать пайплайн при обнаружении секретов
+    rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+############################################################
+# SAST
+semgrep-scan:
+    stage: pre-build
+    image: returntocorp/semgrep:1.99
+    tags:
+      - dev-sec-ops-runner-s064838
+    variables:
+        SEMGREP_OUTPUT: "semgrep-results.sarif"
+    before_script:
+        - semgrep --version
+    script:
+        # Добавлены правила по OWASP TOP 10, без флага error, так как по условию надо exit code 0
+        - semgrep scan
+            --config=p/owasp-top-ten 
+            --config=auto .
+            --sarif $CI_PROJECT_DIR > $CI_PROJECT_DIR/$SEMGREP_OUTPUT
+    artifacts:
+        paths:
+            - $CI_PROJECT_DIR/$SEMGREP_OUTPUT
+        expire_in: 1 week
+        when: always
+    allow_failure: true  # Продолжать pipeline даже при обнаружении уязвимостей
+    rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+############################################################
+# Сборка SBOM
+cdxgen-sbom:
+    stage: pre-build
+    image: node:22
+    tags:
+      - dev-sec-ops-runner-s064838
+    variables:
+        CDXGEN_OUTPUT: "juice-shop-sbom.cdx.json"
+    script:
+        - npm install -g @cyclonedx/cdxgen
+        - npm install -g @cyclonedx/cdxgen-plugins-bin 
+        - cdxgen . -r --json-pretty -o $CI_PROJECT_DIR/$CDXGEN_OUTPUT -p 
+    artifacts:
+        paths:
+            - $CI_PROJECT_DIR/$CDXGEN_OUTPUT
+        expire_in: 1 week
+        when: always
+    allow_failure: true 
+    rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+############################################################
+# SCA
+trivy-sca:
+    stage: pre-build
+    image:
+      name: aquasec/trivy:0.68.1
+      entrypoint: [""]
+    tags:
+     - dev-sec-ops-runner-s064838
+    variables:
+        TRIVY_OUTPUT: "trivy-results.json"
+        CDXGEN_OUTPUT: "juice-shop-sbom.cdx.json"
+    script:
+      -  trivy sbom $CI_PROJECT_DIR/$CDXGEN_OUTPUT --output $CI_PROJECT_DIR/$TRIVY_OUTPUT
+    needs:
+      - cdxgen-sbom
+    artifacts:
+        paths:
+            - $CI_PROJECT_DIR/$TRIVY_OUTPUT
+        expire_in: 1 week
+        when: always
+    allow_failure: true  # Продолжать pipeline даже при обнаружении уязвимостей
+    rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+############################################################
+# Сборка в docker контейнер. Сохраняется все в registry. В артефакте ссылка на образ. 
+docker-build:
+  stage: post-build
+  image: 
+      name: docker:29.7.2-cli
+      entrypoint: [""]
+  services:
+    - docker:dind
+  variables:
+     DOCKER_API_VERSION: "1.41"
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - docker build -t "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" .
+    - docker push "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+    - docker tag "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" "$CI_REGISTRY_IMAGE:latest"
+    - docker push "$CI_REGISTRY_IMAGE:latest"
+    - echo "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA" > image-info.txt
+  artifacts:
+      paths:
+            - image-info.txt
+      expire_in: 1 week
+      when: always
+  allow_failure: true 
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+############################################################
+# Binary SCA. Для генерации SBOM передали образ из registry. Полученный SBOM дальше анализируем.
+trivy-bsca:
+  stage:  post-build
+  image:
+    name: aquasec/trivy:0.68.1
+    entrypoint: [""]
+  variables:
+    TRIVY_SBOM_BIN_OUTPUT: "trivy-sbom-bin-results.json"
+    TRIVY_REPORT_BIN_OUTPUT: "trivy-report-bin-results.json"
+    IMAGE_TO_SCAN: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  script:
+     -  trivy image --format cyclonedx --output $CI_PROJECT_DIR/$TRIVY_SBOM_BIN_OUTPUT $IMAGE_TO_SCAN
+     -  trivy sbom $CI_PROJECT_DIR/$TRIVY_SBOM_BIN_OUTPUT --output $CI_PROJECT_DIR/$TRIVY_REPORT_BIN_OUTPUT
+  needs:
+      - docker-build
+  artifacts:
+      paths:
+            - $CI_PROJECT_DIR/$TRIVY_REPORT_BIN_OUTPUT
+            - $CI_PROJECT_DIR/$TRIVY_SBOM_BIN_OUTPUT
+      expire_in: 1 week
+      when: always
+  allow_failure: true  # Продолжать pipeline даже при обнаружении уязвимостей
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual
+
+############################################################
+# DAST. Для быстроты и наглядности используем zap-baseline.py. 
+zap-scan:
+  stage:  test-time
+  image:
+    name: ghcr.io/zaproxy/zap-stable:2.17.0
+    entrypoint: [""]
+  variables:
+    ZAP_REPORT_DIR: "/zap/wrk"
+    ZAP_OUTPUT: "zap-results.html"
+  before_script:
+   -  mkdir -p $ZAP_REPORT_DIR
+  script:
+   - zap-baseline.py -t "http://juicy.s064838.edu.slurm.io:80" -I -r "$ZAP_OUTPUT"
+   - cp "$ZAP_REPORT_DIR/$ZAP_OUTPUT" "$ZAP_OUTPUT"
+  artifacts:
+      paths:
+            - $ZAP_OUTPUT
+      expire_in: 1 week
+      when: always
+  allow_failure: true  # Продолжать pipeline даже при обнаружении уязвимостей
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual 
